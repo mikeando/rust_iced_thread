@@ -1,5 +1,6 @@
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{mpsc, Arc};
 
 use iced::{
     button, executor, Align, Application, Button, Clipboard, Column, Command, Element, Settings,
@@ -16,14 +17,23 @@ pub fn main() -> iced::Result {
         to_ui.send(a * a).unwrap()
     });
 
-    ThreadWatcher::run(Settings::with_flags((to_worker, from_worker)))
+    let last_recv = Arc::new(AtomicI64::new(0));
+
+    {
+        let last_recv = last_recv.clone();
+        std::thread::spawn(move || loop {
+            let rv = from_worker.recv().unwrap();
+            last_recv.store(rv, Ordering::SeqCst);
+        });
+    }
+
+    ThreadWatcher::run(Settings::with_flags((to_worker, last_recv)))
 }
 
 struct ThreadWatcher {
     last_sent: i64,
-    last_recv: i64,
+    last_recv: Arc<AtomicI64>,
     to_worker: Sender<i64>,
-    from_worker: Receiver<i64>,
     dispatch_button: button::State,
 }
 
@@ -35,16 +45,15 @@ enum Message {
 impl Application for ThreadWatcher {
     type Executor = executor::Default;
 
-    type Flags = (Sender<i64>, Receiver<i64>);
+    type Flags = (Sender<i64>, Arc<AtomicI64>);
     type Message = Message;
 
     fn new(flags: Self::Flags) -> (Self, Command<Self::Message>) {
         (
             ThreadWatcher {
                 last_sent: 0,
-                last_recv: 0,
+                last_recv: flags.1,
                 to_worker: flags.0,
-                from_worker: flags.1,
                 dispatch_button: button::State::default(),
             },
             Command::none(),
@@ -74,7 +83,13 @@ impl Application for ThreadWatcher {
                     .on_press(Message::DispatchPressed),
             )
             .push(Text::new(format!("Last sent: {}", self.last_sent)).size(50))
-            .push(Text::new(format!("Last recv: {}", self.last_recv)).size(50))
+            .push(
+                Text::new(format!(
+                    "Last recv: {}",
+                    self.last_recv.load(Ordering::SeqCst)
+                ))
+                .size(50),
+            )
             .into()
     }
 }
