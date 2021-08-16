@@ -1,26 +1,32 @@
-use core::time;
 use std::hash::{Hash, Hasher};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{mpsc, Arc, Mutex};
+//use std::sync::mpsc::{Receiver, Sender};
+use async_std::channel;
+use async_std::channel::{Receiver, Sender};
 
+use futures_core::Stream;
+use iced::futures::executor::ThreadPool;
 use iced::futures::stream::BoxStream;
+use iced::futures::StreamExt;
 use iced::{
     button, executor, Align, Application, Button, Clipboard, Column, Command, Element, Settings,
     Text,
 };
 use iced_native::subscription::Recipe;
 
-pub fn main() -> iced::Result {
-    let (to_worker, from_ui) = mpsc::channel();
-    let (to_ui, from_worker) = mpsc::channel();
+pub async fn worker_thread(from_ui: Receiver<i64>, to_ui: Sender<i64>) {
+    while let Ok(a) = from_ui.recv().await {
+        println!("worker got {} - sending {}", a, a * a);
+        to_ui.send(a * a).await.unwrap()
+    }
+}
 
-    std::thread::spawn(move || {
-        while let Ok(a) = from_ui.recv() {
-            println!("worker got {} - sending {}", a, a * a);
-            // std::thread::sleep(time::Duration::from_secs(2));
-            to_ui.send(a * a).unwrap()
-        }
-    });
+pub fn main() -> iced::Result {
+    let (to_worker, from_ui) = channel::unbounded();
+    let (to_ui, from_worker) = channel::unbounded();
+
+    let worker_pool = ThreadPool::new().unwrap();
+    let w = worker_thread(from_ui, to_ui);
+    worker_pool.spawn_ok(w);
 
     ThreadWatcher::run(Settings::with_flags((to_worker, from_worker)))
 }
@@ -37,6 +43,7 @@ struct ThreadWatcher {
 enum Message {
     DispatchPressed,
     NewValue(i64),
+    Dummy,
 }
 
 impl Application for ThreadWatcher {
@@ -51,7 +58,7 @@ impl Application for ThreadWatcher {
                 last_sent: 0,
                 last_recv: 0,
                 to_worker: flags.0,
-                from_worker: RecvWrapper(Arc::new(Mutex::new(flags.1))),
+                from_worker: RecvWrapper(flags.1),
                 dispatch_button: button::State::default(),
             },
             Command::none(),
@@ -66,11 +73,18 @@ impl Application for ThreadWatcher {
         match message {
             Message::DispatchPressed => {
                 self.last_sent += 1;
-                self.to_worker.send(self.last_sent).unwrap();
+                let to_worker = self.to_worker.clone();
+                let last_sent = self.last_sent;
+                let f = async move {
+                    to_worker.send(last_sent).await.unwrap();
+                    Message::Dummy
+                };
+                return f.into();
             }
             Message::NewValue(v) => {
                 self.last_recv = v;
             }
+            Message::Dummy => {}
         }
         Command::none()
     }
@@ -94,22 +108,23 @@ impl Application for ThreadWatcher {
 }
 
 #[derive(Clone)]
-struct RecvWrapper<T>(Arc<Mutex<Receiver<T>>>);
+struct RecvWrapper<T>(Receiver<T>);
 
-pub async fn take_from_recv<T>(
-    rx: Arc<Mutex<Receiver<T>>>,
-) -> Option<(T, Arc<Mutex<Receiver<T>>>)> {
-    let v = rx.lock().unwrap().recv();
-    match v {
-        Ok(v) => Some((v, rx)),
-        Err(mpsc::RecvError) => None,
+impl<T> Stream for RecvWrapper<T> {
+    type Item = T;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_next_unpin(cx)
     }
 }
 
 impl<H, E, T> Recipe<H, E> for RecvWrapper<T>
 where
     H: Hasher,
-    T: 'static + Send,
+    T: 'static + Send + Clone,
 {
     type Output = T;
 
@@ -119,7 +134,6 @@ where
     }
 
     fn stream(self: Box<Self>, _input: BoxStream<E>) -> BoxStream<Self::Output> {
-        let s = iced::futures::stream::unfold(self.0, take_from_recv);
-        Box::pin(s)
+        Box::pin(self)
     }
 }
